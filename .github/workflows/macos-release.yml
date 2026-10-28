@@ -1,0 +1,180 @@
+name: macOS release
+
+# Builds a Tauri app for Apple Silicon, signs it with a Developer ID, notarizes and staples it,
+# and publishes it as the GitHub release of the pushed version tag. Each app's repo calls it:
+#   Follow Along  followalong/www.followalong.com  .github/workflows/release.yml
+# as dallasread/releases/.github/workflows/macos-release.yml@main, secrets passed by name,
+# from a job with `permissions: contents: write`.
+#
+# The caller's repo needs <project>/src-tauri (tauri.conf.json, Cargo.lock) and
+# <project>/.tool-versions naming the Rust version. The tag must be v<version>.
+on:
+  workflow_call:
+    inputs:
+      # The folder that holds src-tauri/ and .tool-versions; . for the root.
+      project:
+        type: string
+        default: desktop
+    secrets:
+      # base64 of the Developer ID Application certificate and its private key, exported as .p12
+      APPLE_CERTIFICATE:
+        required: true
+      APPLE_CERTIFICATE_PASSWORD:
+        required: true
+      # The certificate's name or SHA-1
+      APPLE_SIGNING_IDENTITY:
+        required: true
+      APPLE_API_KEY:
+        required: true
+      APPLE_API_ISSUER:
+        required: true
+      # base64 of AuthKey_<APPLE_API_KEY>.p8
+      APPLE_API_KEY_P8:
+        required: true
+      # Only for an app with the Tauri updater: the minisign key itself, and its password.
+      TAURI_SIGNING_PRIVATE_KEY:
+        required: false
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD:
+        required: false
+
+jobs:
+  release:
+    name: Build, notarize and publish
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      SRC_TAURI: ${{ inputs.project }}/src-tauri
+      BUNDLE: ${{ inputs.project }}/src-tauri/target/aarch64-apple-darwin/release/bundle
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      # The scripts this workflow runs. The repo is public, so the caller's token reads it.
+      - name: Clone dallasread/releases
+        uses: actions/checkout@v4
+        with:
+          repository: dallasread/releases
+          ref: main
+          path: .releases
+
+      # The build never reads the tag: v1.2.0 over a conf at 1.1.0 ships 1.1.0 named v1.2.0.
+      - name: Check the tag names the version
+        id: app
+        run: .releases/bin/app-info.sh "$SRC_TAURI" "$GITHUB_REF_NAME" | tee -a "$GITHUB_OUTPUT"
+
+      # Tauri branches on these being present, not non-empty: an unset secret fails after the compile.
+      - name: Check the signing secrets are set
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          missing=
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_P8; do
+            eval "value=\$$name"
+            [ -n "$value" ] || missing="$missing $name"
+          done
+          [ -z "$missing" ] || { echo "::error::Unset secrets:$missing"; exit 1; }
+
+      - name: Check the certificate is a G2 Developer ID
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: .releases/bin/signing-check.sh
+
+      - name: Install Rust
+        run: |
+          rust=$(awk '$1 == "rust" { print $2 }' ${{ inputs.project }}/.tool-versions)
+          rustup toolchain install "$rust" --profile minimal --target aarch64-apple-darwin --component llvm-tools
+          rustup default "$rust"
+
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-tauri
+            ~/.cargo/registry
+            ${{ inputs.project }}/src-tauri/target
+          key: macos-release-${{ runner.os }}-${{ hashFiles(format('{0}/.tool-versions', inputs.project), format('{0}/src-tauri/Cargo.lock', inputs.project)) }}
+
+      - name: Install the Tauri CLI
+        run: |
+          tauri=$(awk '/^name = "tauri"$/ { getline; gsub(/[^0-9.]/, ""); print }' "$SRC_TAURI/Cargo.lock")
+          cargo tauri --version 2>/dev/null | grep -q "^tauri-cli ${tauri%.*}" ||
+            cargo install tauri-cli --version "~${tauri%.*}" --locked --force
+
+      - name: Install Node
+        if: hashFiles('yarn.lock') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: yarn
+      - name: Install dependencies
+        if: hashFiles('yarn.lock') != ''
+        run: yarn install --frozen-lockfile
+
+      - name: Lay down the notarization key
+        env:
+          P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          key="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY.p8"
+          printf '%s' "$P8" | base64 --decode > "$key"
+          chmod 600 "$key"
+          echo "APPLE_API_KEY_PATH=$key" >> "$GITHUB_ENV"
+
+      # Tauri imports the certificate into a throwaway keychain, signs, notarizes and staples the .app.
+      - name: Build
+        working-directory: ${{ inputs.project }}/src-tauri
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: cargo tauri build --target aarch64-apple-darwin
+
+      # Tauri signs the .dmg but never submits it, and Gatekeeper assesses the .dmg on mount.
+      - name: Notarize the installer
+        run: |
+          dmg=$(echo "$BUNDLE"/dmg/*.dmg)
+          xcrun notarytool submit "$dmg" --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
+          xcrun stapler staple "$dmg"
+
+      # What a user's Mac runs: --type open on mount, --type execute on launch.
+      - name: Check what is published is signed and notarized
+        env:
+          APP: ${{ env.BUNDLE }}/macos/${{ steps.app.outputs.name }}.app
+        run: |
+          dmg=$(echo "$BUNDLE"/dmg/*.dmg)
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          xcrun stapler validate "$APP"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature -v "$dmg"
+          spctl --assess --type execute --verbose=4 "$APP"
+
+      # gh names an asset after its file and turns a space into a dot, so the names carry the slug.
+      - name: Stage the assets
+        env:
+          APP: ${{ env.BUNDLE }}/macos/${{ steps.app.outputs.name }}.app
+          ASSET: ${{ steps.app.outputs.slug }}_${{ steps.app.outputs.version }}_aarch64
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          mkdir "$RUNNER_TEMP/dist"
+          cp "$BUNDLE"/dmg/*.dmg "$RUNNER_TEMP/dist/$ASSET.dmg"
+          # The updater's tarball is repacked from the stapled app.
+          [ -z "$TAURI_SIGNING_PRIVATE_KEY" ] || .releases/bin/updater.sh "$APP" "$RUNNER_TEMP/dist/$ASSET.app.tar.gz"
+          ls -lh "$RUNNER_TEMP/dist"
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: ${{ steps.app.outputs.name }} ${{ steps.app.outputs.version }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$TITLE" --generate-notes "$RUNNER_TEMP"/dist/*

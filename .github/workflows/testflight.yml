@@ -1,0 +1,135 @@
+name: TestFlight
+
+# Builds a Tauri app for iOS and uploads it to TestFlight. Each app's repo calls it with its own secrets:
+#   Follow Along  followalong/www.followalong.com  .github/workflows/release.yml
+#   66 Scripts    dallasread/app.66scripts.com     .github/workflows/release-ios.yml
+#   Reviewer      Dev-Review-Inc/dev.review        .github/workflows/testflight.yml
+# as dallasread/releases/.github/workflows/testflight.yml@main. A fix here lands in every app at once.
+#
+# The caller's repo needs <project>/src-tauri (tauri.conf.json, Cargo.lock, gen/apple),
+# <project>/.tool-versions naming the Rust version, and <project>/ios-project.test.sh.
+on:
+  workflow_call:
+    inputs:
+      # The folder that holds src-tauri/, .tool-versions and ios-project.test.sh; . for the root.
+      project:
+        type: string
+        default: desktop
+      # The runners' Xcode 27 is a preview with a beta Xcode, which App Store Connect refuses.
+      # Move this when GitHub ships it as GA; every caller moves with it.
+      xcode:
+        type: string
+        default: '26.6'
+    secrets:
+      APPLE_API_KEY:
+        required: true
+      APPLE_API_ISSUER:
+        required: true
+      # base64 of AuthKey_<APPLE_API_KEY>.p8
+      APPLE_API_KEY_P8:
+        required: true
+      # base64 of the Apple Distribution certificate and its private key, exported as .p12
+      APPLE_DISTRIBUTION_P12:
+        required: true
+      APPLE_DISTRIBUTION_P12_PASSWORD:
+        required: true
+
+jobs:
+  testflight:
+    name: Build and upload
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      - name: Use Xcode ${{ inputs.xcode }}
+        run: sudo xcode-select -s "/Applications/Xcode_${{ inputs.xcode }}.app"
+
+      # llvm-tools: the Swift bridges need llvm-objcopy from the Rust sysroot.
+      - name: Install Rust
+        run: |
+          rust=$(awk '$1 == "rust" { print $2 }' ${{ inputs.project }}/.tool-versions)
+          rustup toolchain install "$rust" --profile minimal --target aarch64-apple-ios --component llvm-tools
+          rustup default "$rust"
+
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-tauri
+            ~/.cargo/registry
+            ${{ inputs.project }}/src-tauri/target
+          key: testflight-${{ runner.os }}-xcode${{ inputs.xcode }}-${{ hashFiles(format('{0}/.tool-versions', inputs.project), format('{0}/src-tauri/Cargo.lock', inputs.project)) }}
+
+      - name: Install the Tauri CLI
+        run: |
+          tauri=$(awk '/^name = "tauri"$/ { getline; gsub(/[^0-9.]/, ""); print }' ${{ inputs.project }}/src-tauri/Cargo.lock)
+          cargo tauri --version 2>/dev/null | grep -q "^tauri-cli ${tauri%.*}" ||
+            cargo install tauri-cli --version "~${tauri%.*}" --locked --force
+
+      # Only an app whose frontend is built with yarn (a yarn.lock at the repo root).
+      - name: Install Node
+        if: hashFiles('yarn.lock') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: yarn
+      - name: Install dependencies
+        if: hashFiles('yarn.lock') != ''
+        run: yarn install --frozen-lockfile
+
+      - name: Check the iOS project
+        run: sh ${{ inputs.project }}/ios-project.test.sh
+
+      - name: Install the signing certificate and API key
+        env:
+          P12: ${{ secrets.APPLE_DISTRIBUTION_P12 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_P12_PASSWORD }}
+          P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(openssl rand -base64 24)
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/distribution.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/distribution.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          rm "$RUNNER_TEMP/distribution.p12"
+          key="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY.p8"
+          echo "$P8" | base64 --decode > "$key"
+          echo "APPLE_API_KEY_PATH=$key" >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: ${{ inputs.project }}/src-tauri
+        run: cargo tauri ios build --export-method app-store-connect
+
+      # The build number that ships is the archive's, so it is read out of the .ipa.
+      - name: Check the .ipa
+        id: ipa
+        working-directory: ${{ inputs.project }}/src-tauri
+        run: |
+          name=$(sed -n 's/.*"productName": "\(.*\)".*/\1/p' tauri.conf.json)
+          ipa="gen/apple/build/arm64/$name.ipa"
+          plist="$RUNNER_TEMP/Info.plist"
+          unzip -p "$ipa" "Payload/$name.app/Info.plist" > "$plist"
+          plutil -p "$plist" | grep -E 'CFBundleIdentifier|CFBundleShortVersionString|CFBundleVersion|ITSAppUsesNonExemptEncryption|UIApplicationSupportsMultipleScenes'
+          case $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist") in
+            *[!0-9]*) echo "::error::The build number is still the version; Set Build Number did not land"; exit 1 ;;
+          esac
+          echo "path=$ipa" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to TestFlight
+        working-directory: ${{ inputs.project }}/src-tauri
+        run: |
+          xcrun altool --upload-app -f "${{ steps.ipa.outputs.path }}" -t ios \
+            --api-key "$APPLE_API_KEY" --api-issuer "$APPLE_API_ISSUER" --p8-file-path "$APPLE_API_KEY_PATH"
+
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
