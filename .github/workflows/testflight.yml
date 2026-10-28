@@ -2,7 +2,7 @@ name: TestFlight
 
 # Builds a Tauri app for iOS and uploads it to TestFlight. Each app's repo calls it with its own secrets:
 #   Follow Along  followalong/www.followalong.com  .github/workflows/release.yml
-#   66 Scripts    dallasread/app.66scripts.com     .github/workflows/release-ios.yml
+#   66 Scripts    dallasread/app.66scripts.com     .github/workflows/release.yml
 #   Reviewer      Dev-Review-Inc/dev.review        .github/workflows/testflight.yml
 # as dallasread/releases/.github/workflows/testflight.yml@main. A fix here lands in every app at once.
 #

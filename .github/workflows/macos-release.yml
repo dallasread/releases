@@ -3,6 +3,8 @@ name: macOS release
 # Builds a Tauri app for Apple Silicon, signs it with a Developer ID, notarizes and staples it,
 # and publishes it as the GitHub release of the pushed version tag. Each app's repo calls it:
 #   Follow Along  followalong/www.followalong.com  .github/workflows/release.yml
+#   66 Scripts    dallasread/app.66scripts.com     .github/workflows/release.yml
+#   Reviewer      Dev-Review-Inc/dev.review        .github/workflows/release.yml
 # as dallasread/releases/.github/workflows/macos-release.yml@main, secrets passed by name,
 # from a job with `permissions: contents: write`.
 #
