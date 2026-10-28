@@ -30,6 +30,8 @@ sha1=$(openssl x509 -in "$tmp/good.pem" -noout -fingerprint -sha1 | sed 's/.*=//
 
 check good "$name" >/dev/null || fail "a G2 Developer ID named in full"
 check good "$sha1" >/dev/null || fail "a G2 Developer ID named by SHA-1"
+# Tauri compares the identity with the name in the .p12, so the check hands on the name.
+check good "$sha1" | grep -qxF "identity=$name" || fail "the name was not handed on for a SHA-1"
 check legacy "$name" >/dev/null || fail "a .p12 in the legacy encryption Keychain Access writes"
 refuses old "$name" | grep -q "G2 Sub-CA" || fail "the old Sub-CA was not named"
 refuses dist "Apple Distribution" | grep -q "not a Developer ID Application" || fail "a distribution certificate was not named"
